@@ -238,7 +238,12 @@ public class Utilities {
      */
 
     @Nullable
-    public static PseudoDocument createPseudoDocument(String entity, @NotNull ArrayList<String> paraList, IndexSearcher searcher) {
+    public static PseudoDocument createPseudoDocument(String entity,
+                                                      String textSearchField,
+                                                      String entitySearchField,
+                                                      String delimiter,
+                                                      @NotNull ArrayList<String> paraList,
+                                                      IndexSearcher searcher) {
         ArrayList<Document> documentList = new ArrayList<>();
         ArrayList<String> pseudoDocEntityList = new ArrayList<>();
         // Get the list of paragraphs relevant for the query
@@ -246,12 +251,16 @@ public class Utilities {
         for (String paraId : paraList) {
             try {
                 // Get the document corresponding to the paragraph from the lucene index
-                Document doc = Index.Search.searchIndex("id", paraId, searcher);
+                Document doc = Index.Search.searchIndex(textSearchField, paraId, searcher);
+
+                if (doc == null) {
+                    continue;
+                }
                 // Get the entities in the paragraph
-                assert doc != null;
-                String[] entityList = Utilities.clean(doc.get("entity").split(" "));
+               // String[] entityList = Utilities.clean(doc.get("entity").split(" "));
+                String[] entityList = Utilities.clean(doc.get(entitySearchField).split(delimiter));
                 // Make an ArrayList from the String array
-                ArrayList<String> pEntList = new ArrayList<>(Arrays.asList(entityList));
+                ArrayList<String> pEntList = process(new ArrayList<>(Arrays.asList(entityList)));
                 // If the document does not have any entities then ignore
                 if (pEntList.isEmpty()) {
                     continue;
@@ -276,6 +285,86 @@ public class Utilities {
         }
         return new PseudoDocument(documentList, entity, pseudoDocEntityList);
     }
+    @Contract(pure = true)
+    public static ArrayList<String> unprocess(List<String> pEntList, @NotNull List<String> entityList) {
+        ArrayList<String> list = new ArrayList<>();
+        for (String e : entityList) {
+            if (pEntList.contains(process(e))) {
+                list.add(e);
+            }
+        }
+        return list;
+    }
+
+    /**
+     * Method to create a Pseudo-Document for an entity.
+     * @param entity String EntityID
+     * @param paraList ArrayList List of paragraphs relevant for query
+     * @param searcher IndexSearcher
+     * @return A Pseudo-Document for the (query, entity) pair
+     */
+
+    @Nullable
+    public static EntityContextDocument createECD(String entity, @NotNull ArrayList<String> paraList, IndexSearcher searcher) {
+        ArrayList<Document> documentList = new ArrayList<>();
+        ArrayList<EntityContextDocument.ContextEntity> pseudoDocEntityList = new ArrayList<>();
+        // Get the list of paragraphs relevant for the query
+        // For every paragraph in the list of paragraphs relevant for the query do
+        for (String paraId : paraList) {
+            try {
+                // Get the document corresponding to the paragraph from the lucene index
+                Document doc = Index.Search.searchIndex("Id", paraId, searcher);
+                // Get the entities in the paragraph
+                assert doc != null;
+                String[] entityList = Utilities.clean(doc.get("OutlinkIds").split("\n"));
+                // Make an ArrayList from the String array
+                ArrayList<String> pEntList = new ArrayList<>(Arrays.asList(entityList));
+                // If the document does not have any entities then ignore
+                if (pEntList.isEmpty()) {
+                    continue;
+                }
+                // If the entity is present in the paragraph
+                if (isPresent(pEntList, entity)) {
+
+                    // Add it to the pseudo document
+                    documentList.add(doc);
+
+                    try {
+
+                        // Add all the entities to the pseudo document entity list
+                        for (String ent : pEntList) {
+                            String eid = ent.split("_")[0];
+                            String anchorText = ent.split("_")[1];
+                            pseudoDocEntityList.add(new EntityContextDocument.ContextEntity(eid, anchorText));
+                        }
+                    } catch (ArrayIndexOutOfBoundsException e) {
+                        System.err.println("ERROR: ArrayIndexOutOfBoundsException");
+                    }
+                }
+
+            } catch (IOException | ParseException e) {
+                e.printStackTrace();
+            }
+
+        }
+
+        // If there are no documents in the pseudo-document
+        if (documentList.size() == 0) {
+            return null;
+        }
+        return new EntityContextDocument(documentList, entity, pseudoDocEntityList);
+    }
+
+    @Contract(pure = true)
+    private static boolean isPresent(@NotNull ArrayList<String> pEntList, String entity) {
+        for (String e : pEntList) {
+           if (e.contains(entity)) {
+               return true;
+           }
+        }
+        return false;
+
+    }
 
     /**
      * Find the intersection of two lists.
@@ -289,19 +378,19 @@ public class Utilities {
         return list1.stream().filter(list2::contains).collect(Collectors.toList());
 
     }
-    public static ArrayList<PseudoDocument> getPseudoDocs(@NotNull ArrayList<String> entityList, ArrayList<String> paraList, IndexSearcher searcher) {
-        ArrayList<PseudoDocument> pseudoDocuments = new ArrayList<>();
-        // For every entity in this list of relevant entities do
-        for (String entityId : entityList) {
-
-            // Create a pseudo-document for the entity
-            PseudoDocument d = createPseudoDocument(entityId, paraList, searcher);
-            if (d != null) {
-                pseudoDocuments.add(d);
-            }
-        }
-        return pseudoDocuments;
-    }
+//    public static ArrayList<PseudoDocument> getPseudoDocs(@NotNull ArrayList<String> entityList, ArrayList<String> paraList, IndexSearcher searcher) {
+//        ArrayList<PseudoDocument> pseudoDocuments = new ArrayList<>();
+//        // For every entity in this list of relevant entities do
+//        for (String entityId : entityList) {
+//
+//            // Create a pseudo-document for the entity
+//            PseudoDocument d = createPseudoDocument(entityId, paraList, searcher);
+//            if (d != null) {
+//                pseudoDocuments.add(d);
+//            }
+//        }
+//        return pseudoDocuments;
+//    }
     /**
      * Converts a PseudoDocument to a Lucene Document.
      * We concatenate all the passages from all the documents contained in a pseudo-document and index it as a

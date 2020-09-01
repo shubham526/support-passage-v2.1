@@ -18,18 +18,20 @@ import org.jetbrains.annotations.NotNull;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Class to make a RAM index.
  * This class uses the Lucene 7.7.0 RAMDirectory to create in-memory indices.
  * NOTE: Use caution in the use of this class! The RAMDirectory class has been marked as deprecated by the developers.
  * @author Shubham Chatterjee
- * @version 03/11/2019
+ * @version 06/9/2020
  */
 public class RAMIndex {
 
-    public static HashMap<Document, Float> searchIndex(String query, int n, IndexSearcher is, QueryParser qp) {
-        HashMap<Document,Float> results = new HashMap<>();
+    @NotNull
+    public static Map<String, Float> searchIndex(String query, int n, IndexSearcher is, @NotNull QueryParser qp) {
+        Map<String, Float> results = new HashMap<>();
         // Parse the query
         Query q = null;
         try {
@@ -45,18 +47,21 @@ public class RAMIndex {
             e.printStackTrace();
         }
         // Retrieve the results
+        assert tds != null;
         ScoreDoc[] retDocs = tds.scoreDocs;
         for (int i = 0; i < retDocs.length; i++) {
             try {
                 Document doc = is.doc(retDocs[i].doc);
+                String pid = doc.getField("id").stringValue();
                 float score = tds.scoreDocs[i].score;
-                results.put(doc, score);
+                results.put(pid, score);
             } catch (IOException e) {
                 e.printStackTrace();
             }
         }
         return results;
     }
+
     /**
      * Search the index for the given query and return top n hits.
      * The query is a Boolean Query which may consist of one or more terms queries.
@@ -64,8 +69,9 @@ public class RAMIndex {
      * @param n Integer Top hits for the query
      * @return HashMap where Key = Document and Value = Score
      */
-    public static HashMap<Document,Float> searchIndex(BooleanQuery query, int n, @NotNull IndexSearcher is) {
-        HashMap<Document,Float> results = new HashMap<>();
+    @NotNull
+    public static  Map<String,Float> searchIndex(BooleanQuery query, int n, @NotNull IndexSearcher is) {
+        Map<String,Float> results = new HashMap<>();
 
         // Search the query
         TopDocs tds = null;
@@ -75,12 +81,14 @@ public class RAMIndex {
             e.printStackTrace();
         }
         // Retrieve the results
+        assert tds != null;
         ScoreDoc[] retDocs = tds.scoreDocs;
         for (int i = 0; i < retDocs.length; i++) {
             try {
                 Document doc = is.doc(retDocs[i].doc);
+                String pid = doc.getField("id").stringValue();
                 float score = tds.scoreDocs[i].score;
-                results.put(doc, score);
+                results.put(pid, score);
             } catch (IOException e) {
                 e.printStackTrace();
             }
@@ -91,7 +99,6 @@ public class RAMIndex {
     /**
      * Build an in-memory index of documents passed as parameters.
      * @param documents The documents to index
-     * @throws IOException
      */
     public static void createIndex(@NotNull List<Document> documents, IndexWriter iw) throws IOException {
         for (Document d : documents) {
@@ -142,7 +149,6 @@ public class RAMIndex {
     /**
      * Get the IndexSearcher.
      * @return IndexSearcher
-     * @throws IOException
      */
     @NotNull
     public static IndexSearcher createSearcher(Similarity similarity, @NotNull IndexWriter iw) throws IOException {
@@ -156,7 +162,6 @@ public class RAMIndex {
     /**
      * Close the directory to release the assciated memory.
      * @param iw IndexWriter
-     * @throws IOException
      */
     public static void close(@NotNull IndexWriter iw) throws IOException {
         iw.getDirectory().close();

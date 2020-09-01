@@ -4,6 +4,7 @@ import api.WATApi;
 import help.PseudoDocument;
 import help.Utilities;
 import lucene.Index;
+import me.tongfei.progressbar.ProgressBar;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.en.EnglishAnalyzer;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
@@ -19,60 +20,36 @@ import org.jetbrains.annotations.NotNull;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ForkJoinPool;
 
-public class GetEntities {
-    private final Map<String, Map<String, String>> contextEntityMap = new ConcurrentHashMap<>();
-    private Map<String, Integer> entityIDMap = new ConcurrentHashMap<>();
+public class GetEntityId {
+    private final Map<String, Integer> entityIDMap = new ConcurrentHashMap<>();
     private final HashMap<String, ArrayList<String>> entityRankings;
     private final HashMap<String, ArrayList<String>> paraRankings;
     private final HashMap<String, ArrayList<String>> entityQrels;
     private final IndexSearcher pageIndexSearcher;
     private final IndexSearcher paraIndexSearcher;
-    private String relType;
+    private final boolean parallel;
 
-    public GetEntities(String pageIndexDir,
+    public GetEntityId(String pageIndexDir,
                        String paraIndexDir,
                        String mainDir,
                        String dataDir,
                        String outputDir,
                        String paraRunFile,
                        String entityRunFile,
-                       String idFile,
-                       String entityQrelFilePath,
-                       String contextEntityFile,
-                       @NotNull String relType,
+                       String entityQrelFile,
+                       String outputFile,
                        String mode,
+                       boolean parallel,
                        Analyzer analyzer,
                        Similarity similarity) {
 
         String paraRunFilePath = mainDir + "/" + dataDir + "/" + paraRunFile;
         String entityRunFilePath = mainDir + "/" + dataDir + "/" + entityRunFile;
-        String idFilePath = mainDir + "/" + dataDir + "/" + idFile;
-        String contextEntityFilePath = mainDir + "/" + outputDir + "/" + contextEntityFile;
-
-        if (relType.equalsIgnoreCase("mw")) {
-            System.out.println("Entity Similarity Measure: Milne-Witten");
-            this.relType = "mw";
-        } else if (relType.equalsIgnoreCase("jaccard")) {
-            System.out.println("Entity Similarity Measure: Jaccard");
-            this.relType = "jaccard";
-        } else if (relType.equalsIgnoreCase("lm")) {
-            System.out.println("Entity Similarity Measure: Language Models");
-            this.relType = "lm";
-        } else if (relType.equalsIgnoreCase("w2v")) {
-            System.out.println("Entity Similarity Measure: Word2Vec");
-            this.relType = "w2v";
-        } else if (relType.equalsIgnoreCase("cp")) {
-            System.out.println("Entity Similarity Measure: Conditional Probability");
-            this.relType = "conditionalprobability";
-        } else if (relType.equalsIgnoreCase("ba")) {
-            System.out.println("Entity Similarity Measure: Barabasi-Albert on the Wikipedia Graph");
-            this.relType = "barabasialbert";
-        } else if (relType.equalsIgnoreCase("pmi")) {
-            System.out.println("Entity Similarity Measure: Pointwise Mutual Information");
-            this.relType = "pmi";
-        }
-
+        String outputFilePath = mainDir + "/" + outputDir + "/" + outputFile;
+        String entityQrelFilePath = mainDir + "/" + dataDir + "/" + entityQrelFile;
+        this.parallel = parallel;
 
         System.out.print("Reading entity rankings...");
         entityRankings = Utilities.getRankings(entityRunFilePath);
@@ -86,14 +63,6 @@ public class GetEntities {
         entityQrels = Utilities.getRankings(entityQrelFilePath);
         System.out.println("[Done].");
 
-        System.out.print("Reading id file...");
-        try {
-            entityIDMap = Utilities.readMap(idFilePath);
-        } catch (IOException | ClassNotFoundException e) {
-            e.printStackTrace();
-        }
-        System.out.println("[Done].");
-
         System.out.print("Setting up paragraph index for use...");
         paraIndexSearcher = new Index.Setup(paraIndexDir, "text", analyzer, similarity).getSearcher();
         System.out.println("[Done].");
@@ -102,7 +71,7 @@ public class GetEntities {
         pageIndexSearcher = new Index.Setup(pageIndexDir, "OutlinkIds", analyzer, similarity).getSearcher();
         System.out.println("[Done].");
 
-        getEntities(contextEntityFilePath, mode);
+        getEntities(outputFilePath, mode);
 
     }
 
@@ -113,22 +82,63 @@ public class GetEntities {
 
         if (mode.equalsIgnoreCase("page")) {
             System.out.println("Getting page entities");
-            // Do in parallel
-            querySet.parallelStream().forEach(this::getPageEntities);
+            if (parallel) {
+                System.out.println("Using Parallel Streams.");
+                int parallelism = ForkJoinPool.commonPool().getParallelism();
+                int numOfCores = Runtime.getRuntime().availableProcessors();
+                System.out.println("Number of available processors = " + numOfCores);
+                System.out.println("Number of threads generated = " + parallelism);
 
-            // Do in series
-            //querySet.forEach(this::getPageEntities);
+                if (parallelism == numOfCores - 1) {
+                    System.err.println("WARNING: USING ALL AVAILABLE PROCESSORS");
+                    System.err.println("USE: \"-Djava.util.concurrent.ForkJoinPool.common.parallelism=N\" " +
+                            "to set the number of threads used");
+                }
+                // Do in parallel
+                querySet.parallelStream().forEach(this::getPageEntities);
+            } else {
+                System.out.println("Using Sequential Streams.");
+
+                // Do in serial
+                ProgressBar pb = new ProgressBar("Progress", querySet.size());
+                for (String q : querySet) {
+                    getPageEntities(q);
+                    pb.step();
+                }
+                pb.close();
+            }
         } else {
             System.out.println("Getting ECN entities");
-            // Do in parallel
-            querySet.parallelStream().forEach(this::getECNEntities);
-            // Do in series
-            //querySet.forEach(this::getECNEntities);
+            if (parallel) {
+                System.out.println("Using Parallel Streams.");
+                int parallelism = ForkJoinPool.commonPool().getParallelism();
+                int numOfCores = Runtime.getRuntime().availableProcessors();
+                System.out.println("Number of available processors = " + numOfCores);
+                System.out.println("Number of threads generated = " + parallelism);
+
+                if (parallelism == numOfCores - 1) {
+                    System.err.println("WARNING: USING ALL AVAILABLE PROCESSORS");
+                    System.err.println("USE: \"-Djava.util.concurrent.ForkJoinPool.common.parallelism=N\" " +
+                            "to set the number of threads used");
+                }
+                // Do in parallel
+                querySet.parallelStream().forEach(this::getECNEntities);
+            } else {
+                System.out.println("Using Sequential Streams.");
+
+                // Do in serial
+                ProgressBar pb = new ProgressBar("Progress", querySet.size());
+                for (String q : querySet) {
+                    getECNEntities(q);
+                    pb.step();
+                }
+                pb.close();
+            }
         }
 
         System.out.print("Writing to file....");
         try {
-            Utilities.writeMap(contextEntityMap, contextEntityFilePath);
+            Utilities.writeMap(entityIDMap, contextEntityFilePath);
         } catch (IOException e) {
             e.printStackTrace();
         }
@@ -137,7 +147,7 @@ public class GetEntities {
 
 
     private void getECNEntities(String queryId) {
-        Map<String, String> ecnEntityMap;
+
         // Get the list of passages retrieved for the query
         ArrayList<String> paraList = paraRankings.get(queryId);
         if (entityQrels.containsKey(queryId) && entityQrels.containsKey(queryId)) {
@@ -156,58 +166,46 @@ public class GetEntities {
             for (String entityId : retEntitySet) {
 
                 // Get the list of all entities on the Wikipedia page of this entity.
-                ecnEntityMap = getECNEntityMap(entityId, paraList);
+                getECNEntityMap(entityId, paraList);
 
-                // Store
-                contextEntityMap.put(entityId, ecnEntityMap);
             }
+        }
+        if (parallel) {
+            System.out.println("Done: " + queryId);
         }
 
     }
 
-    @NotNull
-    private Map<String, String> getECNEntityMap(String entityId,
-                                                ArrayList<String> paraList) {
+    private void getECNEntityMap(String entityId, ArrayList<String> paraList) {
+        int id;
+        id = getID(entityId);
+        entityIDMap.put(entityId, id);
+
         // Create a pseudo-document for the entity
         PseudoDocument d = Utilities.createPseudoDocument(entityId, "id", "entity",
                 " ", paraList, paraIndexSearcher);
-        List<String> pseudoDocEntityList;
-        Map<String, String> relMap = new HashMap<>();
+        Set<String> pseudoDocEntitySet;
 
         // Get the list of entities that co-occur with this entity in the pseudo-document
         if (d != null) {
 
             // Get the list of co-occurring entities
-            pseudoDocEntityList = d.getEntityList();
+            pseudoDocEntitySet = new HashSet<>(d.getEntityList());
 
             // For every co-occurring entity do
-            for (String e : pseudoDocEntityList) {
-
-                // If the entity also occurs in the list of entities relevant for the query then
-                // And the relMap does not already contain this entity
-
-
-                ////////////////////////////////////////////////////////////////////////////////////////////////
-                // The condition is important because pseudoDocEntityList contains multiple occurrences
-                // of the same entity (the original method depended on the frequency of the co-occurring entities).
-                // However, for the purposes of this experiment, we are using the relatedness score between two
-                // entities and hence we don't need multiple occurrences of the same entity. Finding relatedness
-                // of same entity multiple times is going to increase run-time.
-                ////////////////////////////////////////////////////////////////////////////////////////////////
-
-                if (!relMap.containsKey(e)) {
-
-                    // Find the relation score of this entity with the given entity and store it
-                    String s = getRelatedness(entityId, Utilities.unprocess(e));
-                    relMap.put(e, s);
+            for (String eid : pseudoDocEntitySet) {
+                // Check to see of it already exists
+                if (!entityIDMap.containsKey(eid)) {
+                    id = getID(toTitleCase(eid));
+                    entityIDMap.put(eid, id);
                 }
+
             }
         }
-        return relMap;
     }
 
     private void getPageEntities(String queryId) {
-        Map<String, String> pageEntityMap;
+
         if (entityQrels.containsKey(queryId) && entityQrels.containsKey(queryId)) {
 
             // Get the set of entities retrieved for the query
@@ -224,16 +222,18 @@ public class GetEntities {
             for (String entityId : retEntitySet) {
 
                 // Get the list of all entities on the Wikipedia page of this entity.
-                pageEntityMap = getPageEntityMap(entityId);
-
-                // Store
-                contextEntityMap.put(entityId, pageEntityMap);
+                 getPageEntityMap(entityId);
             }
         }
+        if (parallel) {
+            System.out.println("Done: " + queryId);
+        }
     }
-    @NotNull
-    private Map<String, String> getPageEntityMap(String entityID) {
-        Map<String, String> pageEntityMap = new HashMap<>();
+
+    private void getPageEntityMap(String entityID) {
+        int id;
+        id = getID(entityID);
+        entityIDMap.put(entityID, id);
 
         try {
             // Get the document corresponding to the entityID from the page.lucene index
@@ -245,61 +245,41 @@ public class GetEntities {
             // Make a list from this string
             String[] entityArray = entityString.split("\n");
             for (String eid : entityArray) {
-                //double rel = getRelatedness(entityID, eid);
-                String s = getRelatedness(entityID, eid);
-                pageEntityMap.put(Utilities.process(eid), s);
+                // Check to see of it already exists
+                if (!entityIDMap.containsKey(eid)) {
+                    id = getID(toTitleCase(eid));
+                    entityIDMap.put(eid, id);
+                }
             }
 
         } catch (IOException | ParseException e) {
             e.printStackTrace();
         }
-        return pageEntityMap;
     }
     @NotNull
-    private String getRelatedness(@NotNull String e1, @NotNull String e2) {
+    private Integer getID(String entity) {
+        entity = entity.substring(entity.indexOf(":") + 1)                // remove enwiki: from query
+                .replaceAll("%20", "_");     // replace %20 with whitespace
 
-        int id1, id2;
-
-        String s1 = toTitleCase(e1.substring(e1.indexOf(":") + 1).replaceAll("%20", "_"));
-        String s2 = toTitleCase(e2.substring(e1.indexOf(":") + 1).replaceAll("%20", "_"));
-
-        id1 = entityIDMap.containsKey(e1)
-                ? entityIDMap.get(e1)
-                : WATApi.TitleResolver.getId(s1);
-
-        id2 = entityIDMap.containsKey(e2)
-                ? entityIDMap.get(e2)
-                : WATApi.TitleResolver.getId(s2);
-
-        if (s1.equalsIgnoreCase(s2)) {
-            return id2 + ":" + 1;
-        }
-
-
-        if (id1 < 0 || id2 < 0) {
-            return id2 + ":" + 0;
-        }
-
-
-
-        List<WATApi.EntityRelatedness.Pair> pair = WATApi.EntityRelatedness.getRelatedness(relType,id1, id2);
-        if (!pair.isEmpty()) {
-            return id2 + ":" + pair.get(0).getRelatedness();
-        } else {
-            return id2 + ":" + 0;
-        }
+        return WATApi.TitleResolver.getId(entity);
     }
     @NotNull
     private String toTitleCase(@NotNull String givenString) {
         String[] arr = givenString.split("_");
         StringBuilder sb = new StringBuilder();
 
-        for (String s : arr) {
-            sb.append(Character.toUpperCase(s.charAt(0)))
-                    .append(s.substring(1)).append(" ");
+        try {
+
+            for (String s : arr) {
+                sb.append(Character.toUpperCase(s.charAt(0)))
+                        .append(s.substring(1)).append(" ");
+            }
+        } catch (StringIndexOutOfBoundsException e) {
+            System.err.println("ERROR in toTitleCase(): " + e.getMessage());
         }
-        return sb.toString().trim().replaceAll(" ","_");
+        return sb.toString().trim().replaceAll(" ", "_");
     }
+
 
     public static void main(@NotNull String[] args) {
         String pageIndexDir = args[0];
@@ -309,11 +289,12 @@ public class GetEntities {
         String outputDir = args[4];
         String paraRunFile = args[5];
         String entityRunFile = args[6];
-        String idFile = args[7];
-        String entityQrelFilePath = args[8];
+        String entityQrelFile = args[7];
+        String outputFile = args[8];
         String mode = args[9];
-        String a = args[10];
-        String sim = args[11];
+        boolean parallel = args[10].equalsIgnoreCase("true");
+        String a = args[11];
+        String sim = args[12];
 
         Analyzer analyzer = null;
         Similarity similarity = null;
@@ -344,7 +325,7 @@ public class GetEntities {
                 System.out.println("Similarity: LMJM");
                 float lambda;
                 try {
-                    lambda = Float.parseFloat(args[12]);
+                    lambda = Float.parseFloat(args[13]);
                     System.out.println("Lambda = " + lambda);
                     similarity = new LMJelinekMercerSimilarity(lambda);
                 } catch (IndexOutOfBoundsException e) {
@@ -363,22 +344,8 @@ public class GetEntities {
                 System.exit(1);
         }
 
-        Scanner sc = new Scanner(System.in);
-        System.out.println("Enter the entity relation type to use. Your choices are:");
-        System.out.println("mw (Milne-Witten)");
-        System.out.println("jaccard (Jaccard measure of pages outlinks)");
-        System.out.println("lm (language model)");
-        System.out.println("w2v (Word2Vect)");
-        System.out.println("cp (Conditional Probability)");
-        System.out.println("ba (Barabasi-Albert on the Wikipedia Graph)");
-        System.out.println("pmi (Pointwise Mutual Information)");
-        System.out.println("Enter you choice:");
-        String relType = sc.nextLine();
-
-        String outputFile = "benchmarkY1-train-" + mode + "-entities-rel-" + relType;
-
-        new GetEntities(pageIndexDir,paraIndexDir, mainDir, dataDir,outputDir, paraRunFile, entityRunFile, idFile,
-                entityQrelFilePath, outputFile, relType, mode, analyzer, similarity);
+        new GetEntityId(pageIndexDir,paraIndexDir, mainDir, dataDir,outputDir, paraRunFile, entityRunFile,
+                entityQrelFile, outputFile, mode, parallel, analyzer, similarity);
 
     }
 

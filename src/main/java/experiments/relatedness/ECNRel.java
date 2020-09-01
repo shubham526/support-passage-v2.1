@@ -2,6 +2,7 @@ package experiments.relatedness;
 
 import api.WATApi;
 import help.PseudoDocument;
+
 import help.Utilities;
 import lucene.Index;
 import me.tongfei.progressbar.ProgressBar;
@@ -16,17 +17,19 @@ import org.apache.lucene.search.similarities.LMJelinekMercerSimilarity;
 import org.apache.lucene.search.similarities.Similarity;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static help.Utilities.process;
 
 
 /**
- * ===================================Experiment-2================================
+ * ===================================ECNRel================================
  * Apply ECN with related entities.
  * Instead of using frequency of co-occurring entities, use relation score.
  * Relation score obtained with WAT.
@@ -36,7 +39,7 @@ import static help.Utilities.process;
  * @version 03/22/2020
  */
 
-public class Experiment2 {
+public class ECNRel {
 
     private final IndexSearcher searcher;
     //HashMap where Key = queryID and Value = list of paragraphs relevant for the queryID
@@ -46,28 +49,31 @@ public class Experiment2 {
     private final HashMap<String, ArrayList<String>> entityQrels;
     // ArrayList of run strings
     private final ArrayList<String> runStrings;
-    private Map<String, Integer> entityIDMap = new ConcurrentHashMap<>();
+    private Map<String, Map<String, Double>> entRelMap = new ConcurrentHashMap<>();
     private String relType;
     private final boolean parallel;
+    private final AtomicInteger count = new AtomicInteger(0);
+    private int N;
 
-    public Experiment2(String indexDir,
-                       String mainDir,
-                       String outputDir,
-                       String dataDir,
-                       String passageRunFile,
-                       String entityRunFile,
-                       String idFile,
-                       String outFile,
-                       String entityQrelFilePath,
-                       @NotNull String relType,
-                       boolean parallel,
-                       Analyzer analyzer,
-                       Similarity similarity) {
+    public ECNRel(String indexDir,
+                  String mainDir,
+                  String outputDir,
+                  String dataDir,
+                  String passageRunFile,
+                  String entityRunFile,
+                  String relFile,
+                  String outFile,
+                  String entityQrel,
+                  @NotNull String relType,
+                  boolean parallel,
+                  Analyzer analyzer,
+                  Similarity similarity) {
 
 
         String entityRunFilePath = mainDir + "/" + dataDir + "/" + entityRunFile;
         String passageRunFilePath = mainDir + "/" + dataDir + "/" + passageRunFile;
-        String idFilePath = mainDir + "/" + dataDir + "/" + idFile;
+        String entityQrelPath = mainDir + "/" + dataDir + "/" + entityQrel;
+        String relFilePath = mainDir + "/" + dataDir + "/" + relFile;
         String outFilePath = mainDir + "/" + outputDir + "/" + outFile;
         this.runStrings = new ArrayList<>();
         this.parallel = parallel;
@@ -104,12 +110,12 @@ public class Experiment2 {
         System.out.println("[Done].");
 
         System.out.print("Reading entity ground truth...");
-        entityQrels = Utilities.getRankings(entityQrelFilePath);
+        entityQrels = Utilities.getRankings(entityQrelPath);
         System.out.println("[Done].");
 
-        System.out.print("Reading id file...");
+        System.out.print("Reading relatedness file...");
         try {
-            entityIDMap = Utilities.readMap(idFilePath);
+            entRelMap = Utilities.readMap(relFilePath);
         } catch (IOException | ClassNotFoundException e) {
             e.printStackTrace();
         }
@@ -133,6 +139,7 @@ public class Experiment2 {
     private  void feature(String outFilePath) {
         //Get the set of queries
         Set<String> querySet = entityRankings.keySet();
+        N = querySet.size();
 
         if (parallel) {
             System.out.println("Using Parallel Streams.");
@@ -158,6 +165,7 @@ public class Experiment2 {
                 pb.step();
             }
             pb.close();
+
         }
 
 
@@ -180,7 +188,7 @@ public class Experiment2 {
 
     private void doTask(String queryId) {
         List<String> pseudoDocEntityList;
-        Map<String, Double> relDist = new HashMap<>();
+        Map<String, Double> relDist;
 
         if (entityRankings.containsKey(queryId) && entityQrels.containsKey(queryId)) {
             ArrayList<String> processedEntityList = process(entityRankings.get(queryId));
@@ -203,8 +211,10 @@ public class Experiment2 {
             // For every entity in this list of relevant entities do
             for (String entityId : retEntitySet) {
 
+
                 // Create a pseudo-document for the entity
-                PseudoDocument d = Utilities.createPseudoDocument(entityId, paraList, searcher);
+                PseudoDocument d = Utilities.createPseudoDocument(entityId, "id", "entity",
+                        " ", paraList, searcher);
 
                 // Get the list of entities that co-occur with this entity in the pseudo-document
                 if (d != null) {
@@ -220,7 +230,12 @@ public class Experiment2 {
                     scoreDoc(queryId, d, relDist);
                 }
             }
-            System.out.println("Done query: " + queryId);
+            if (parallel) {
+                count.getAndIncrement();
+                System.out.println("Progress: " + count + " of " + N);
+
+            }
+
         }
     }
 
@@ -248,71 +263,41 @@ public class Experiment2 {
 
     }
 
+
     @NotNull
     private Map<String, Double> getDistribution(String entityId,
                                                 @NotNull List<String> pseudoDocEntityList,
                                                 ArrayList<String> processedEntityList) {
 
         Map<String, Double> relMap = new HashMap<>();
-        // For every co-occurring entity do
-        for (String e : pseudoDocEntityList) {
-
-            // If the entity also occurs in the list of entities relevant for the query then
-            // And the relMap does not already contain this entity
-
-
-            ////////////////////////////////////////////////////////////////////////////////////////////////
-            // The second condition is important because pseudoDocEntityList contains multiple occurrences
-            // of the same entity (the original method depended on the frequency of the co-occurring entities).
-            // However, for the purposes of this experiment, we are using the relatedness score between two
-            // entities and hence we don't need multiple occurrences of the same entity. Finding relatedness
-            // of same entity multiple times is going to increase run-time.
-            ////////////////////////////////////////////////////////////////////////////////////////////////
-
-            if (processedEntityList.contains(e) && !relMap.containsKey(e)) {
-
-                // Find the relation score of this entity with the given entity and store it
-                relMap.put(e, getRelatedness(entityId, Utilities.unprocess(e)));
+        String processedEntity1 = processString(entityId);
+        double relatedness = 0;
+        Set<String> pseudoDocEntitySet = new HashSet<>(pseudoDocEntityList);
+        Set<String> processedEntitySet = new HashSet<>(processedEntityList);
+        if (processedEntity1 != null) {
+            // For every co-occurring entity do
+            for (String e : pseudoDocEntitySet) {
+                String processedEntity2 = processString(e);
+                if (processedEntity2 == null) {
+                    continue;
+                }
+                if (processedEntity1.equalsIgnoreCase(processedEntity2)) {
+                    relatedness = 1.0;
+                } else if (entRelMap.get(entityId).containsKey(e)) {
+                    relatedness = entRelMap.get(entityId).get(e);
+                } else if (processedEntitySet.contains(e)) {
+                    int id1 = WATApi.TitleResolver.getId(processedEntity1);
+                    int id2 = WATApi.TitleResolver.getId(processedEntity2);
+                    relatedness = getRelatedness(id1, id2);
+                }
+                relMap.put(e, relatedness);
             }
         }
         return relMap;
     }
 
-
-    /**
-     * Helper method.
-     * Returns the relatedness between between two entities.
-     * @param e1 String First Entity.
-     * @param e2 String Second Entity
-     * @return Double Relatedness
-     */
-
-    private double getRelatedness(@NotNull String e1, String e2) {
-
-        int id1, id2;
-        String s1, s2;
-
-        if (e1.equalsIgnoreCase(e2)) {
-            return 1.0d;
-        }
-
-        if (entityIDMap.containsKey(e1)) {
-            id1 = entityIDMap.get(e1);
-        } else {
-            s1 = e1.substring(e1.indexOf(":") + 1).replaceAll("%20", "_");
-            id1 = WATApi.TitleResolver.getId(s1);
-            entityIDMap.put(e1, id1);
-        }
-
-        if (entityIDMap.containsKey(e2)) {
-            id2 = entityIDMap.get(e2);
-        } else {
-            s2 = e2.substring(e2.indexOf(":") + 1).replaceAll("%20", "_");
-            id2 = WATApi.TitleResolver.getId(s2);
-            entityIDMap.put(e2, id2);
-            //System.out.println("Queried WAT");
-        }
-
+    @NotNull
+    private Double getRelatedness(int id1, int id2) {
         if (id1 < 0 || id2 < 0) {
             return 0.0d;
         }
@@ -322,6 +307,22 @@ public class Experiment2 {
             return pair.get(0).getRelatedness();
         } else {
             return 0.0d;
+        }
+    }
+
+    @Nullable
+    private String processString(@NotNull String e) {
+        e = e.substring(e.indexOf(":") + 1).replaceAll("%20", "_");
+        try {
+            String[] parts = e.split("_");
+            parts[0] = parts[0].substring(0, 1).toUpperCase() + parts[0].substring(1);
+            for (int i = 1; i < parts.length; i++) {
+                parts[i] = parts[i].substring(0, 1).toLowerCase() + parts[i].substring(1);
+            }
+            return String.join("_", parts);
+        } catch (StringIndexOutOfBoundsException ex) {
+            System.err.println("ERROR in preprocessString(): " + ex.getMessage());
+            return null;
         }
     }
 
@@ -373,7 +374,7 @@ public class Experiment2 {
             double score = paraScore.get(paraId);
             if (score > 0) {
                 runFileString = queryId + "+" +entityId + " Q0 " + paraId + " " + rank++
-                        + " " + score + " " + "exp2";
+                        + " " + score + " " + "ECNRel";
                 runStrings.add(runFileString);
             }
 
@@ -392,7 +393,7 @@ public class Experiment2 {
         String dataDir = args[3];
         String paraRunFile = args[4];
         String entityRunFile = args[5];
-        String idFile = args[6];
+        String relFile = args[6];
         String entityQrel = args[7];
         String relType = args[8];
         String p = args[9];
@@ -451,13 +452,13 @@ public class Experiment2 {
                 System.exit(1);
         }
 
-        String outFile = "ecn-rel-ent-" + s1 + "-" + relType + ".run";
+        String outFile = "ECNRel-" + s1 + "-" + relType + ".run";
         if (p.equalsIgnoreCase("true")) {
             parallel = true;
         }
 
 
-        new Experiment2(indexDir, mainDir, outputDir, dataDir, paraRunFile, entityRunFile, idFile,
+        new ECNRel(indexDir, mainDir, outputDir, dataDir, paraRunFile, entityRunFile, relFile,
                 outFile, entityQrel, relType, parallel, analyzer, similarity);
     }
 

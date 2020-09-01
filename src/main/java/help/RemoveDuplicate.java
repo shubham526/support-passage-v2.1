@@ -46,7 +46,7 @@ public class RemoveDuplicate {
                 double score = paraScore.get(paraId);
                 if (score > 0) {
                     runFileString = queryId + " Q0 " + paraId + " " + rank++
-                            + " " + score + " " + "exp4";
+                            + " " + score + " " + "Salience-Exp1-Sal";
                     runStrings.add(runFileString);
                 }
             }

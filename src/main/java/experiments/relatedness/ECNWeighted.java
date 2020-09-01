@@ -9,7 +9,6 @@ import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.en.EnglishAnalyzer;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
 import org.apache.lucene.document.Document;
-import org.apache.lucene.queryparser.classic.ParseException;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.similarities.BM25Similarity;
 import org.apache.lucene.search.similarities.LMDirichletSimilarity;
@@ -17,28 +16,28 @@ import org.apache.lucene.search.similarities.LMJelinekMercerSimilarity;
 import org.apache.lucene.search.similarities.Similarity;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
+import java.math.RoundingMode;
+import java.text.DecimalFormat;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * ========================================Experiment-4=================================
- * (1) Obtain candidate entity set from either:
- *     (a) Passage rankings
- *     (b) Entity rankings
- * (2) Use all entities in the candidate set obtained in (1).
- * (3) For every entity e' in (1), find Rel(e,e') where e is the target entity.
- * (4) Find ECD for e.
- * (5) Score of a passage p in ECD, Score(p|q,e) = Sum Rel(e,e') for all e' in p.
- * =====================================================================================
+ * ===================================================ECNWeighted====================================================
+ * Weighted ECN.
+ * When scoring candidate support passages using ECNFreq, weigh the scores by the relatedness to the target entity.
+ * Relation score obtained with WAT.
+ * ==================================================================================================================
  *
- * @author Shubham Chatterjee
- * @version 4/1/2020
+ * @author Shubham Chaterjee
+ * @version 6/19/2020
  */
 
-public class Experiment4 {
+public class ECNWeighted {
 
     private final IndexSearcher searcher;
     //HashMap where Key = queryID and Value = list of paragraphs relevant for the queryID
@@ -48,22 +47,23 @@ public class Experiment4 {
     private final HashMap<String, ArrayList<String>> entityQrels;
     // ArrayList of run strings
     private final ArrayList<String> runStrings;
-    private Map<String, Integer> entityIDMap = new ConcurrentHashMap<>();
-    private String relType;
-    private final boolean usePsgCandidate;
     private final boolean parallel;
+    private final DecimalFormat df;
+    private Map<String, Map<String, Double>> entRelMap = new ConcurrentHashMap<>();
+    private String relType;
+    private final AtomicInteger count = new AtomicInteger(0);
+    private int N;
 
-    public Experiment4(String indexDir,
+    public ECNWeighted(String indexDir,
                        String mainDir,
                        String outputDir,
                        String dataDir,
                        String passageRunFile,
                        String entityRunFile,
-                       String idFile,
+                       String relFile,
                        String outFile,
-                       String entityQrelFilePath,
+                       String entityQrelFile,
                        @NotNull String relType,
-                       boolean usePsgCandidate,
                        boolean parallel,
                        Analyzer analyzer,
                        Similarity similarity) {
@@ -71,11 +71,14 @@ public class Experiment4 {
 
         String entityRunFilePath = mainDir + "/" + dataDir + "/" + entityRunFile;
         String passageRunFilePath = mainDir + "/" + dataDir + "/" + passageRunFile;
-        String idFilePath = mainDir + "/" + dataDir + "/" + idFile;
+        String entityQrelFilePath = mainDir + "/" + dataDir + "/" + entityQrelFile;
+        String relFilePath = mainDir + "/" + dataDir + "/" + relFile;
         String outFilePath = mainDir + "/" + outputDir + "/" + outFile;
         this.runStrings = new ArrayList<>();
-        this.usePsgCandidate = usePsgCandidate;
         this.parallel = parallel;
+
+        df = new DecimalFormat("#.####");
+        df.setRoundingMode(RoundingMode.CEILING);
 
         if (relType.equalsIgnoreCase("mw")) {
             System.out.println("Entity Similarity Measure: Milne-Witten");
@@ -100,12 +103,6 @@ public class Experiment4 {
             this.relType = "pmi";
         }
 
-        if (usePsgCandidate) {
-            System.out.println("Candidate Entity Set Obtained From: Passage Ranking.");
-        } else {
-            System.out.println("Candidate Entity Set Obtained From: Entity Ranking.");
-        }
-
         System.out.print("Reading entity rankings...");
         entityRankings = Utilities.getRankings(entityRunFilePath);
         System.out.println("[Done].");
@@ -114,14 +111,13 @@ public class Experiment4 {
         paraRankings = Utilities.getRankings(passageRunFilePath);
         System.out.println("[Done].");
 
-
         System.out.print("Reading entity ground truth...");
         entityQrels = Utilities.getRankings(entityQrelFilePath);
         System.out.println("[Done].");
 
-        System.out.print("Reading id file...");
+        System.out.print("Reading relatedness file...");
         try {
-            entityIDMap = Utilities.readMap(idFilePath);
+            entRelMap = Utilities.readMap(relFilePath);
         } catch (IOException | ClassNotFoundException e) {
             e.printStackTrace();
         }
@@ -134,10 +130,18 @@ public class Experiment4 {
         feature(outFilePath);
 
     }
-    private  void feature(String outFilePath) {
 
+    /**
+     * Method to calculate the feature.
+     * Works in parallel using Java 8 parallelStreams.
+     * DEFAULT THREAD POOL SIZE = NUMBER OF PROCESSORS
+     * USE : System.setProperty("java.util.concurrent.ForkJoinPool.common.parallelism", "N") to set the thread pool size
+     */
+
+    private  void feature(String outFilePath) {
         //Get the set of queries
         Set<String> querySet = entityRankings.keySet();
+        N = querySet.size();
 
         if (parallel) {
             System.out.println("Using Parallel Streams.");
@@ -163,6 +167,7 @@ public class Experiment4 {
                 pb.step();
             }
             pb.close();
+            //doTask("enwiki:Genetically%20modified%20organism");
         }
 
 
@@ -173,20 +178,21 @@ public class Experiment4 {
         System.out.println("Run file written at: " + outFilePath);
     }
 
+    /**
+     * Helper method.
+     * For every query, look at all the entities relevant for the query.
+     * For every such entity, create a pseudo-document consisting of passages which contain this entity.
+     * For every co-occurring entity in the pseudo-document, if the entity is also relevant for the query,
+     * then find the frequency of this entity in the pseudo-document and score the passages using this frequency information.
+     *
+     * @param queryId String
+     */
+
     private void doTask(String queryId) {
-        List<PseudoDocument> pseudoDocuments = new ArrayList<>();
-        Set<String> psgEntitySet = new HashSet<>();
+        ArrayList<String> pseudoDocEntityList;
+        Map<String, Integer> freqDist;
 
         if (entityRankings.containsKey(queryId) && entityQrels.containsKey(queryId)) {
-
-            // Get the list of passages for the query
-            ArrayList<String> paraList = paraRankings.get(queryId);
-
-            if (usePsgCandidate) {
-                // If using the passage rankings as source of entities
-                // Get all entities in the top-K passages
-                psgEntitySet = getEntityList(paraList);
-            }
 
             // Get the set of entities retrieved for the query
             Set<String> retEntitySet = new HashSet<>(entityRankings.get(queryId));
@@ -196,20 +202,15 @@ public class Experiment4 {
 
             // Get the number of retrieved entities which are also relevant
             // Finding support passage for non-relevant entities makes no sense!!
+
             retEntitySet.retainAll(relEntitySet);
 
-            // For every entity in this list of relevant retrieved entities do
+            // Get the list of passages retrieved for the query
+            ArrayList<String> paraList = paraRankings.get(queryId);
+            // For every entity in this list of relevant entities do
             for (String entityId : retEntitySet) {
-                Map<String, Double> relMap;
+                //if (! entityId.equalsIgnoreCase("enwiki:Genetic%20disorder")) continue;
 
-                // Get the relatedness of this entity to every entity in the candidate entity set
-                // candidate entity set obtained either from passage ranking or entity ranking
-
-                if (usePsgCandidate) {
-                    relMap = getEntityToCandEntityRel(entityId, psgEntitySet);
-                } else {
-                    relMap = getEntityToCandEntityRel(entityId, retEntitySet);
-                }
 
                 // Create a pseudo-document for the entity
                 PseudoDocument d = Utilities.createPseudoDocument(entityId, "id", "entity",
@@ -217,47 +218,74 @@ public class Experiment4 {
 
                 if (d != null) {
 
-                    // Add it to the list of pseudo-documents for this entity
-                    pseudoDocuments.add(d);
+                    // Get the list of entities that co-occur with this entity in the pseudo-document
+                    pseudoDocEntityList = d.getEntityList();
+
+                    // Find the frequency distribution over the co-occurring entities
+                    freqDist = getDistribution(pseudoDocEntityList, retEntitySet);
+
+                    if (freqDist.isEmpty()) {
+                        continue;
+                    }
+
+                    // Score the passages in the pseudo-document for this entity using the frequency distribution of
+                    // co-occurring entities
+                    scoreDoc(queryId, d, freqDist);
                 }
-                // Now score the passages in the pseudo-documents
-                scorePassage(queryId, pseudoDocuments, relMap);
             }
-            System.out.println("Done query: " + queryId);
+            if (parallel) {
+                count.getAndIncrement();
+                System.out.println("Progress: " + count + " of " + N);
 
-
+            }
         }
     }
-    private void scorePassage(String query,
-                              @NotNull List<PseudoDocument> pseudoDocuments,
-                              Map<String, Double> relMap) {
+
+    @NotNull
+    private Map<String, Integer> getDistribution(@NotNull ArrayList<String> pseudoDocEntityList,
+                                                Set<String> retEntitySet) {
+
+        HashMap<String, Integer> freqMap = new HashMap<>();
+        Set<String> processedRetEntitySet = new HashSet<>(Utilities.process(new ArrayList<>(retEntitySet)));
 
 
-        // For every pseudo-document do
-        for (PseudoDocument d : pseudoDocuments) {
+        // For every co-occurring entity do
+        for (String e : pseudoDocEntityList) {
+            // If the entity also occurs in the list of entities relevant for the query then
+            if (processedRetEntitySet.contains(e)) {
 
-            // Get the entity corresponding to the pseudo-document
-            String entityId = d.getEntity();
-            Map<String, Double> scoreMap = new HashMap<>();
-
-            // Get the list of documents in the pseudo-document corresponding to the entity
-            ArrayList<Document> documents = d.getDocumentList();
-
-            // For every document do
-            for (Document doc : documents) {
-
-                // Get the paragraph id of the document
-                String paraId = doc.getField("id").stringValue();
-
-                // Get the score of the document
-                double score = getParaScore(doc, relMap);
-
-                // Store the paragraph id and score in a HashMap
-                scoreMap.put(paraId, score);
+                // Find the frequency of this entity in the pseudo-document and store it
+                //freqMap.put(e, Utilities.frequency(e, pseudoDocEntityList));
+                freqMap.compute(e, (t, oldV) -> (oldV == null) ? 1 : oldV + 1);
             }
-            // Make the run file strings for query-entity and document
-            makeRunStrings(query, entityId, scoreMap);
         }
+        return freqMap;
+    }
+
+    private void scoreDoc(String queryId, @NotNull PseudoDocument d, Map<String, Integer> freqMap) {
+        // Get the entity corresponding to the pseudo-document
+        String entityId = d.getEntity();
+        HashMap<String, Double> scoreMap = new HashMap<>();
+
+        // Get the list of documents in the pseudo-document corresponding to the entity
+        ArrayList<Document> documents = d.getDocumentList();
+        String entity = d.getEntity();
+
+        // For every document do
+        for (Document doc : documents) {
+
+            // Get the paragraph id of the document
+            String paraId = doc.getField("id").stringValue();
+
+            // Get the score of the document
+            double score = getParaScore(entity,doc, freqMap);
+
+            // Store the paragraph id and score in a HashMap
+            scoreMap.put(paraId, score);
+        }
+
+        makeRunStrings(queryId, entityId, scoreMap);
+
     }
 
     /**
@@ -265,104 +293,58 @@ public class Experiment4 {
      * This method looks at all the entities in the paragraph and calculates the score from them.
      * For every entity in the paragraph, if the entity has a score from the entity context pseudo-document,
      * then sum over the entity scores and store the score in a HashMap.
+     *
+     *
+     * @param entity String
      * @param doc  Document
-     * @param relMap HashMap where Key = entity id and Value = score
+     * @param freqMap HashMap where Key = entity id and Value = score
      * @return Integer
      */
 
-    @Contract("null, _ -> fail")
-    private double getParaScore(Document doc, Map<String, Double> relMap) {
+    @Contract("_, null, _ -> fail")
+    private double getParaScore(String entity, Document doc, Map<String, Integer> freqMap) {
+        String processedEntity1 = processString(entity);
+        double entityScore, paraScore = 0, relatedness;
+        if (processedEntity1 != null) {
 
-        double entityScore, paraScore = 0;
-        // Get the entities in the paragraph
-        // Make an ArrayList from the String array
-        assert doc != null;
-        ArrayList<String> pEntList = Utilities.getEntities(doc);
-        /* For every entity in the paragraph do */
-        for (String e : pEntList) {
-            // Lookup this entity in the HashMap of scores for the entities
-            // Sum over the scores of the entities to get the score for the passage
-            // Store the passage score in the HashMap
-            if (relMap.containsKey(e)) {
-                entityScore = relMap.get(e);
-                paraScore += entityScore;
+            // Get the entities in the paragraph
+            // Make an ArrayList from the String array
+            assert doc != null;
+            Set<String> passageEntitySet = new HashSet<>(Utilities.getEntities(doc));
+            /* For every entity in the paragraph do */
+            for (String e : passageEntitySet) {
+                String processedEntity2 = processString(e);
+                if (processedEntity2 == null) {
+                    continue;
+                }
+                // Lookup this entity in the HashMap of frequencies for the entities
+                // Sum over the scores of the entities to get the score for the passage
+                // Store the passage score in the HashMap
+                if (freqMap.containsKey(e)) {
+                    entityScore = freqMap.get(e);
+                    if (processedEntity1.equalsIgnoreCase(processedEntity2)) {
+                        // If both  are same
+                        relatedness = 1.0;
+                    } else if (entRelMap.get(entity).containsKey(e)) {
+                        // If relatedness can be found in the Map
+                        relatedness = entRelMap.get(entity).get(e);
+                    } else {
+                        // Otherwise query the WAT server
+                        int id1 = WATApi.TitleResolver.getId(processedEntity1);
+                        int id2 = WATApi.TitleResolver.getId(processedEntity2);
+                        relatedness = getRelatedness(id1, id2);
+                    }
+                    paraScore += (relatedness + entityScore);
+                }
+
             }
-
         }
         return paraScore;
     }
 
-    /**
-     * Method to make the run file strings.
-     *
-     * @param queryId  Query ID
-     * @param scoreMap HashMap of the scores for each paragraph
-     */
-
-    private void makeRunStrings(String queryId, String entityId, Map<String, Double> scoreMap) {
-        LinkedHashMap<String, Double> paraScore = Utilities.sortByValueDescending(scoreMap);
-        String runFileString;
-        int rank = 1;
-
-        for (String paraId : paraScore.keySet()) {
-            double score = paraScore.get(paraId);
-            if (score > 0) {
-                runFileString = queryId + "+" +entityId + " Q0 " + paraId + " " + rank++
-                        + " " + score + " " + "exp4";
-                runStrings.add(runFileString);
-            }
-
-        }
-    }
-
-    @NotNull
-    private Map<String, Double> getEntityToCandEntityRel(String targetEntity,
-                                                         @NotNull Set<String> entitySet) {
-        Map<String, Double> relMap = new HashMap<>();
-        String e = "";
-        double relatedness;
-
-        for (String ent : entitySet) {
-            if (usePsgCandidate) {
-                e = Utilities.unprocess(ent);
-                relatedness = getRelatedness(targetEntity, e);
-                relMap.put(ent, relatedness);
-            } else {
-                relatedness = getRelatedness(targetEntity, ent);
-                relMap.put(Utilities.process(ent), relatedness);
-            }
 
 
-        }
-        return relMap;
-    }
-    private double getRelatedness(@NotNull String e1, String e2) {
-
-
-        int id1, id2;
-        String s1, s2;
-
-        if (e1.equalsIgnoreCase(e2)) {
-            return 1.0d;
-        }
-
-        if (entityIDMap.containsKey(e1)) {
-            id1 = entityIDMap.get(e1);
-        } else {
-            s1 = e1.substring(e1.indexOf(":") + 1).replaceAll("%20", "_");
-            id1 = WATApi.TitleResolver.getId(s1);
-            entityIDMap.put(e1, id1);
-        }
-
-        if (entityIDMap.containsKey(e2)) {
-            id2 = entityIDMap.get(e2);
-        } else {
-            s2 = e2.substring(e2.indexOf(":") + 1).replaceAll("%20", "_");
-            id2 = WATApi.TitleResolver.getId(s2);
-            entityIDMap.put(e2, id2);
-            //System.out.println("Queried WAT");
-        }
-
+    private double getRelatedness(int id1, int id2) {
         if (id1 < 0 || id2 < 0) {
             return 0.0d;
         }
@@ -375,52 +357,67 @@ public class Experiment4 {
         }
     }
 
-    @NotNull
-    private Set<String> getEntityList(@NotNull List<String> topKPsgList) {
-        Set<String> entityList = new HashSet<>();
-
-        for (String paraId : topKPsgList) {
-            // Get the corresponding lucene document
-            Document doc = null;
-            try {
-                doc = Index.Search.searchIndex("id", paraId, searcher);
-            } catch (IOException | ParseException e) {
-                e.printStackTrace();
+    @Nullable
+    private String processString(@NotNull String e) {
+        e = e.substring(e.indexOf(":") + 1).replaceAll("%20", "_");
+        try {
+            String[] parts = e.split("_");
+            parts[0] = parts[0].substring(0, 1).toUpperCase() + parts[0].substring(1);
+            for (int i = 1; i < parts.length; i++) {
+                parts[i] = parts[i].substring(0, 1).toLowerCase() + parts[i].substring(1);
             }
-            if (doc != null) {
-                // Get the list of entities in the document
-                List<String> docEntityList = Utilities.getEntities(doc);
-                // Add all entities to entityList
-                entityList.addAll(docEntityList);
-            }
+            return String.join("_", parts);
+        } catch (StringIndexOutOfBoundsException ex) {
+            System.err.println("ERROR in preprocessString(): " + ex.getMessage());
+            return null;
         }
-        return entityList;
     }
+
+    /**
+     * Method to make the run file strings.
+     *
+     * @param queryId  Query ID
+     * @param scoreMap HashMap of the scores for each paragraph
+     */
+
+    private void makeRunStrings(String queryId, String entityId, HashMap<String, Double> scoreMap) {
+        LinkedHashMap<String, Double> paraScore = Utilities.sortByValueDescending(scoreMap);
+        String runFileString;
+        int rank = 1;
+
+        for (String paraId : paraScore.keySet()) {
+            double score = Double.parseDouble(df.format(paraScore.get(paraId)));
+            if (score > 0) {
+                runFileString = queryId + "+" +entityId + " Q0 " + paraId + " " + rank + " " + score + " " + "ECNWeighted";
+                runStrings.add(runFileString);
+                rank++;
+            }
+
+        }
+    }
+    /**
+     * Main method.
+     * @param args Command Line arguments
+     */
 
     public static void main(@NotNull String[] args) {
         String indexDir = args[0];
         String mainDir = args[1];
         String outputDir = args[2];
         String dataDir = args[3];
-        String passageRunFile = args[4];
+        String paraRunFile = args[4];
         String entityRunFile = args[5];
-        String idFile = args[6];
-        String entityQrelFilePath = args[7];
+        String relFile = args[6];
+        String entityQrel = args[7];
         String relType = args[8];
-        String candidateType = args[9];
-        String p = args[10];
-        String a = args[11];
-        String sim = args[12];
+        String p = args[9];
+        String a = args[10];
+        String sim = args[11];
 
         Analyzer analyzer = null;
         Similarity similarity = null;
         String s1 = null;
         boolean parallel = false;
-        boolean usePsgCandidate = false;
-
-        if (candidateType.equalsIgnoreCase("passage")) {
-            usePsgCandidate = true;
-        }
 
         switch (a) {
             case "std" :
@@ -448,7 +445,7 @@ public class Experiment4 {
                 System.out.println("Similarity: LMJM");
                 float lambda;
                 try {
-                    lambda = Float.parseFloat(args[13]);
+                    lambda = Float.parseFloat(args[12]);
                     System.out.println("Lambda = " + lambda);
                     similarity = new LMJelinekMercerSimilarity(lambda);
                     s1 = "lmjm";
@@ -469,12 +466,15 @@ public class Experiment4 {
                 System.exit(1);
         }
 
-        String outFile = "rel-all-ent-cand-set-" + candidateType + "-" + s1 + "-" + relType + ".run";
+        String outFile = "ECNWeighted-" + s1 + "-" + relType + ".run";
         if (p.equalsIgnoreCase("true")) {
             parallel = true;
         }
-        new Experiment4(indexDir, mainDir, outputDir, dataDir, passageRunFile, entityRunFile, idFile, outFile,
-                entityQrelFilePath, relType, usePsgCandidate, parallel, analyzer, similarity);
+
+
+        new ECNWeighted(indexDir, mainDir, outputDir, dataDir, paraRunFile, entityRunFile, relFile,
+                outFile, entityQrel, relType, parallel, analyzer, similarity);
     }
+
 
 }

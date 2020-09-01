@@ -5,14 +5,15 @@ import org.jetbrains.annotations.Contract;
 import java.util.ArrayList;
 
 /**
- * Class to represent a pseudo-document for an entity.
+ * Class to represent an Entity Context Document for an entity.
  * @author Shubham Chatterjee
- * @version 02/25/2019
+ * @version 05/31/2020
  */
 public class PseudoDocument {
-    private ArrayList<Document> documentList;
-    private String entity;
-    private ArrayList<String> entityList;
+
+    private final ArrayList<Document> documentList;
+    private final String entity;
+    private final ArrayList<String> entityList;
 
     /**
      * Construcor.
